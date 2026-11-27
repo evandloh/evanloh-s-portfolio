@@ -1,0 +1,166 @@
+"""
+Pairs trading model: Nike (NKE) vs Adidas (ADDYY, USD-denominated ADR).
+
+Pipeline
+  1. Download adjusted daily closes
+  2. Engle-Granger cointegration test on log prices (full-sample diagnostic)
+  3. Rolling OLS hedge ratio  ->  spread = log(NKE) - beta * log(ADDYY) - alpha
+  4. Rolling z-score of the spread
+  5. Mean-reversion signals: enter at |z| > ENTRY, exit at |z| < EXIT, stop at |z| > STOP
+  6. Backtest with no look-ahead (positions lagged 1 day) and transaction costs
+  7. Performance stats + plots
+
+Usage:  python nke_adidas_pairs.py
+"""
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import coint, adfuller
+
+
+Y_TICKER, X_TICKER = "NKE", "ADDYY"   # ADDYY = Adidas ADR (USD); avoids FX mismatch vs ADS.DE
+START, END = "2015-01-01", None
+BETA_WINDOW = 252      # lookback for rolling hedge ratio (days)
+Z_WINDOW = 60          # lookback for spread mean / std (days)
+ENTRY_Z = 2.0
+EXIT_Z = 0.5
+STOP_Z = 4.0
+COST_BPS = 5           # one-way cost per leg, basis points of notional traded
+TRADING_DAYS = 252
+
+
+
+def load_prices(tickers, start, end):
+    px = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    return px[tickers].dropna()
+
+
+
+def cointegration_report(logy, logx):
+    t_stat, p_val, crit = coint(logy, logx)
+    X = sm.add_constant(logx)
+    model = sm.OLS(logy, X).fit()
+    resid = model.resid
+    # half-life of mean reversion from AR(1) on spread: d(s) = lambda * s_{t-1}
+    lag = resid.shift(1).dropna()
+    delta = resid.diff().dropna()
+    lam = sm.OLS(delta, sm.add_constant(lag)).fit().params.iloc[1]
+    half_life = -np.log(2) / lam if lam < 0 else np.inf
+
+    print("=== Full-sample cointegration diagnostics ===")
+    print(f"Hedge ratio (beta): {model.params.iloc[1]:.4f}   alpha: {model.params.iloc[0]:.4f}")
+    print(f"Engle-Granger t-stat: {t_stat:.3f}   p-value: {p_val:.4f}   "
+          f"crit (1/5/10%): {np.round(crit, 3)}")
+    print(f"ADF p-value on residual spread: {adfuller(resid)[1]:.4f}")
+    print(f"Half-life of mean reversion: {half_life:.1f} days")
+    print("-> Cointegrated at 5%" if p_val < 0.05 else
+          "-> NOT cointegrated at 5% over full sample (trade with caution; rolling model adapts)")
+    print()
+    return half_life
+
+
+def rolling_hedge(logy, logx, window):
+    """Rolling OLS of logy on logx; uses only data up to t (no look-ahead)."""
+    cov = logy.rolling(window).cov(logx)
+    var = logx.rolling(window).var()
+    beta = cov / var
+    alpha = logy.rolling(window).mean() - beta * logx.rolling(window).mean()
+    return alpha, beta
+
+
+def generate_positions(z, entry, exit_, stop):
+    """State machine: +1 = long spread (long NKE, short ADDYY), -1 = short spread."""
+    pos = np.zeros(len(z))
+    state = 0
+    for i, zi in enumerate(z.values):
+        if np.isnan(zi):
+            state = 0
+        elif state == 0:
+            if zi > entry and zi < stop:
+                state = -1
+            elif zi < -entry and zi > -stop:
+                state = 1
+        elif state == 1 and (zi > -exit_ or zi < -stop):
+            state = 0
+        elif state == -1 and (zi < exit_ or zi > stop):
+            state = 0
+        pos[i] = state
+    return pd.Series(pos, index=z.index)
+
+
+def backtest(px, beta, pos, cost_bps):
+    """
+    Dollar-neutral-ish portfolio: 1 unit in Y, -beta units in X (scaled to gross = 1).
+    Signal at close t is traded at close t, earning returns from t+1 (shift by 1).
+    """
+    rets = px.pct_change()
+    w_y = pos / (1 + beta.abs())
+    w_x = -pos * beta / (1 + beta.abs())
+    w_y, w_x = w_y.shift(1), w_x.shift(1)          # no look-ahead
+    gross = w_y * rets[Y_TICKER] + w_x * rets[X_TICKER]
+    turnover = w_y.diff().abs() + w_x.diff().abs()
+    costs = turnover * cost_bps / 1e4
+    return (gross - costs).fillna(0), turnover.fillna(0)
+
+
+def performance(r, pos):
+    eq = (1 + r).cumprod()
+    years = len(r) / TRADING_DAYS
+    cagr = eq.iloc[-1] ** (1 / years) - 1
+    vol = r.std() * np.sqrt(TRADING_DAYS)
+    sharpe = r.mean() / r.std() * np.sqrt(TRADING_DAYS) if r.std() > 0 else np.nan
+    dd = eq / eq.cummax() - 1
+    trades = int((pos.diff().abs() > 0).sum() // 1)
+    in_mkt = (pos != 0).mean()
+    print("=== Backtest performance ===")
+    print(f"Period:        {r.index[0].date()} -> {r.index[-1].date()}")
+    print(f"Total return:  {eq.iloc[-1] - 1:8.2%}")
+    print(f"CAGR:          {cagr:8.2%}")
+    print(f"Ann. vol:      {vol:8.2%}")
+    print(f"Sharpe:        {sharpe:8.2f}")
+    print(f"Max drawdown:  {dd.min():8.2%}")
+    print(f"Position changes: {trades}   Time in market: {in_mkt:.1%}")
+    return eq, dd
+
+
+def main():
+    px = load_prices([Y_TICKER, X_TICKER], START, END)
+    logp = np.log(px)
+    logy, logx = logp[Y_TICKER], logp[X_TICKER]
+
+    cointegration_report(logy, logx)
+
+    alpha, beta = rolling_hedge(logy, logx, BETA_WINDOW)
+    spread = logy - beta * logx - alpha
+    z = (spread - spread.rolling(Z_WINDOW).mean()) / spread.rolling(Z_WINDOW).std()
+
+    pos = generate_positions(z, ENTRY_Z, EXIT_Z, STOP_Z)
+    strat_r, _ = backtest(px, beta, pos, COST_BPS)
+
+    valid = beta.first_valid_index()
+    strat_r, pos_v = strat_r.loc[valid:], pos.loc[valid:]
+    eq, dd = performance(strat_r, pos_v)
+
+    print(f"\nCurrent: beta={beta.iloc[-1]:.3f}  z={z.iloc[-1]:.2f}  "
+          f"position={'LONG spread' if pos.iloc[-1] > 0 else 'SHORT spread' if pos.iloc[-1] < 0 else 'FLAT'}")
+
+    fig, ax = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    (px / px.iloc[0]).plot(ax=ax[0], title="Normalized prices")
+    beta.plot(ax=ax[1], title=f"Rolling hedge ratio ({BETA_WINDOW}d)", color="tab:purple")
+    z.plot(ax=ax[2], title="Spread z-score", color="gray", lw=0.8)
+    for lvl, c in [(ENTRY_Z, "r"), (-ENTRY_Z, "g"), (EXIT_Z, "k"), (-EXIT_Z, "k")]:
+        ax[2].axhline(lvl, color=c, ls="--", lw=0.8)
+    ax[2].fill_between(z.index, -5, 5, where=pos > 0, color="g", alpha=0.1, label="long spread")
+    ax[2].fill_between(z.index, -5, 5, where=pos < 0, color="r", alpha=0.1, label="short spread")
+    ax[2].set_ylim(-5, 5); ax[2].legend(loc="upper left")
+    eq.plot(ax=ax[3], title="Strategy equity (net of costs)", color="tab:blue")
+    plt.tight_layout()
+    plt.savefig("nke_adidas_pairs.png", dpi=120)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
