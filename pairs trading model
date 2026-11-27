@@ -13,6 +13,7 @@ Pipeline
 Usage:  python nke_adidas_pairs.py
 """
 
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -20,7 +21,7 @@ import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import coint, adfuller
 
-
+# ----------------------------- parameters -----------------------------
 Y_TICKER, X_TICKER = "NKE", "ADDYY"   # ADDYY = Adidas ADR (USD); avoids FX mismatch vs ADS.DE
 START, END = "2015-01-01", None
 BETA_WINDOW = 252      # lookback for rolling hedge ratio (days)
@@ -32,13 +33,13 @@ COST_BPS = 5           # one-way cost per leg, basis points of notional traded
 TRADING_DAYS = 252
 
 
-
+# ----------------------------- data -----------------------------------
 def load_prices(tickers, start, end):
     px = yf.download(tickers, start=start, end=end, auto_adjust=True, progress=False)["Close"]
     return px[tickers].dropna()
 
 
-
+# ----------------------------- diagnostics ----------------------------
 def cointegration_report(logy, logx):
     t_stat, p_val, crit = coint(logy, logx)
     X = sm.add_constant(logx)
@@ -62,6 +63,7 @@ def cointegration_report(logy, logx):
     return half_life
 
 
+# ----------------------------- model ----------------------------------
 def rolling_hedge(logy, logx, window):
     """Rolling OLS of logy on logx; uses only data up to t (no look-ahead)."""
     cov = logy.rolling(window).cov(logx)
@@ -126,6 +128,7 @@ def performance(r, pos):
     return eq, dd
 
 
+# ----------------------------- main -----------------------------------
 def main():
     px = load_prices([Y_TICKER, X_TICKER], START, END)
     logp = np.log(px)
@@ -142,12 +145,13 @@ def main():
 
     valid = beta.first_valid_index()
     strat_r, pos_v = strat_r.loc[valid:], pos.loc[valid:]
-    eq, dd = performance(strat_r, pos_v)
+    eq, _ = performance(strat_r, pos_v)
 
     print(f"\nCurrent: beta={beta.iloc[-1]:.3f}  z={z.iloc[-1]:.2f}  "
           f"position={'LONG spread' if pos.iloc[-1] > 0 else 'SHORT spread' if pos.iloc[-1] < 0 else 'FLAT'}")
 
-    fig, ax = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+    # --------------------------- plots ---------------------------
+    _, ax = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
     (px / px.iloc[0]).plot(ax=ax[0], title="Normalized prices")
     beta.plot(ax=ax[1], title=f"Rolling hedge ratio ({BETA_WINDOW}d)", color="tab:purple")
     z.plot(ax=ax[2], title="Spread z-score", color="gray", lw=0.8)
@@ -158,7 +162,9 @@ def main():
     ax[2].set_ylim(-5, 5); ax[2].legend(loc="upper left")
     eq.plot(ax=ax[3], title="Strategy equity (net of costs)", color="tab:blue")
     plt.tight_layout()
-    plt.savefig("nke_adidas_pairs.png", dpi=120)
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nke_adidas_pairs.png")
+    plt.savefig(out_path, dpi=120)
+    print(f"Saved chart to {out_path}")
     plt.show()
 
 
